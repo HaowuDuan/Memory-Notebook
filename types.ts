@@ -1,3 +1,4 @@
+
 export type AppState = 'LANDING' | 'UPLOAD' | 'RENDERING' | 'SESSION' | 'REVIEW';
 
 export type SessionState = 'IDLE' | 'LISTENING' | 'THINKING' | 'SPEAKING';
@@ -16,12 +17,16 @@ export interface PhotoData {
 }
 
 export interface Particle {
-  x: number;
-  y: number;
+  x: number;      // World Space X
+  y: number;      // World Space Y
+  z: number;      // World Space Z
   originX: number;
   originY: number;
-  color: string;
-  size: number;
-  velocity: { x: number; y: number };
-  alpha: number;
+  originZ: number;
+  color: string;  // rgb(r,g,b) string
+  baseSize: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  life: number;   // For sparkles/fading
 }
