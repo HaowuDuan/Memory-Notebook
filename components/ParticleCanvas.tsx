@@ -44,7 +44,7 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
     }
     const texture = new THREE.CanvasTexture(canvas);
     return new THREE.PointsMaterial({
-      size: 0.15,
+      size: 0.5,
       map: texture,
       vertexColors: true,
       transparent: true,
@@ -74,13 +74,13 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setClearColor(0x000000, 0);
-     // Ensure canvas fills the container
-     renderer.domElement.style.position = 'absolute';
-     renderer.domElement.style.top = '0';
-     renderer.domElement.style.left = '0';
-     renderer.domElement.style.width = '100%';
-     renderer.domElement.style.height = '100%';
-     
+    // Ensure canvas fills the container
+    renderer.domElement.style.position = 'absolute';
+    renderer.domElement.style.top = '0';
+    renderer.domElement.style.left = '0';
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
+
     containerRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -143,8 +143,8 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
             const b = data[i + 2] / 255;
             const a = data[i + 3];
 
-            // Skip dark/transparent pixels and downsample for a sparser cloud
-            if (a > 50 && (r + g + b) > 0.3 && Math.random() > 0.65) {
+            // Skip dark/transparent pixels - high density sampling for rich visuals
+            if (a > 50 && (r + g + b) > 0.3 && Math.random() > 0.45) {
               // Center the positions
               const pX = (x - width / 2) * 0.2;
               const pY = -(y - height / 2) * 0.2; // Invert Y for 3D
@@ -160,7 +160,7 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
         }
       } else {
         // --- LANDING MODE: Deep Starfield ---
-        const particleCount = 2000;
+        const particleCount = 5000;
         for (let i = 0; i < particleCount; i++) {
           const x = (Math.random() - 0.5) * 150;
           const y = (Math.random() - 0.5) * 150;
@@ -176,8 +176,8 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
       geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
 
       const material = getSpriteMaterial();
-      // Adjust size based on mode
-      material.size = img ? 0.3 : 0.6;
+      // Adjust size based on mode - boosted for better visibility
+      material.size = img ? 0.5 : 0.8;
 
       const points = new THREE.Points(geometry, material);
       if (img) {
