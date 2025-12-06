@@ -6,6 +6,10 @@ import { AppState, SessionState, PhotoData, MemoryTurn } from './types';
 import { SYSTEM_INSTRUCTION } from './constants';
 import ParticleCanvas from './components/ParticleCanvas';
 import AmbiencePlayer from './components/AmbiencePlayer';
+import VoiceSubtitle from './components/VoiceSubtitle';
+import MicButton from './components/MicButton';
+import VoiceWaveform from './components/VoiceWaveform';
+import VoiceStatusIndicator, { VoiceConnectionStatus } from './components/VoiceStatusIndicator';
 import { PCM_SAMPLE_RATE, createPcmBlob, decodeAudioData, base64ToUint8Array } from './services/audioStreamer';
 
 export default function App() {
@@ -23,6 +27,9 @@ export default function App() {
   
   // Visual Reactivity
   const [audioLevel, setAudioLevel] = useState(0); // 0.0 - 1.0 for visuals
+  
+  // Voice UI States
+  const [voiceStatus, setVoiceStatus] = useState<VoiceConnectionStatus>('idle');
 
   // Refs for API & Audio
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
@@ -99,6 +106,7 @@ export default function App() {
     initAudioContext();
     setIsMusicPlaying(true);
     setSessionState('IDLE');
+    setVoiceStatus('connecting');
 
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
@@ -147,6 +155,7 @@ export default function App() {
         callbacks: {
             onopen: () => {
                 console.log("Session Opened");
+                setVoiceStatus('connected');
                 // Send Image Context immediately
                 sessionPromise.then(session => {
                     session.sendRealtimeInput({
@@ -223,8 +232,14 @@ export default function App() {
                     setSessionState('IDLE');
                 }
             },
-            onclose: () => console.log("Session Closed"),
-            onerror: (err) => console.error("Session Error", err)
+            onclose: () => {
+                console.log("Session Closed");
+                setVoiceStatus('idle');
+            },
+            onerror: (err) => {
+                console.error("Session Error", err);
+                setVoiceStatus('error');
+            }
         }
     });
 
@@ -299,10 +314,13 @@ export default function App() {
     <div className="relative z-10 flex flex-col h-screen">
         {/* Header / Top Bar */}
         <div className="flex justify-between items-center p-6 text-white/50 z-20">
-            <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${sessionState === 'IDLE' ? 'bg-yellow-500' : sessionState === 'SPEAKING' ? 'bg-green-500' : 'bg-blue-500'} animate-pulse`} />
-                <span className="text-xs tracking-widest uppercase">{sessionState}</span>
-            </div>
+            <VoiceStatusIndicator 
+              status={voiceStatus} 
+              showLabel={true}
+              label="Gemini"
+              size={10}
+              glowIntensity={8}
+            />
             <div className="flex items-center gap-4">
                  <button onClick={() => setMusicVolume(v => v === 0 ? 0.5 : 0)}>
                      {musicVolume === 0 ? <X size={16}/> : <Volume2 size={16} />}
@@ -319,15 +337,35 @@ export default function App() {
             </div>
         </div>
 
-        {/* Central Visual Area (Handled by background canvas mostly, but we add caption overlay) */}
+        {/* Central Visual Area */}
         <div className="flex-1 flex flex-col items-center justify-center relative p-6">
-            {currentText && (
-                <div className="absolute bottom-32 max-w-2xl text-center">
-                    <p className="text-2xl md:text-3xl font-serif leading-relaxed text-white/90 drop-shadow-lg transition-all duration-300">
-                        "{currentText}"
-                    </p>
+            {/* Voice Waveform - Shows above subtitle when speaking */}
+            {sessionState === 'SPEAKING' && (
+                <div className="absolute top-1/3 left-1/2 -translate-x-1/2 z-20">
+                    <VoiceWaveform 
+                        audioLevel={audioLevel}
+                        isActive={true}
+                        type="bars"
+                        color="rgba(255, 255, 255, 0.8)"
+                        barCount={40}
+                        smoothing={0.7}
+                        height={60}
+                        width="300px"
+                    />
                 </div>
             )}
+
+            {/* Voice Subtitle - AI's spoken text */}
+            <VoiceSubtitle 
+                text={currentText}
+                isVisible={!!currentText}
+                maxWidth="70%"
+                opacity={0.6}
+                fontSize="text-2xl md:text-3xl"
+                position="bottom"
+                typewriterEffect={true}
+                typewriterSpeed={30}
+            />
             
             {/* Guide hint if idle */}
             {sessionState === 'IDLE' && transcript.length === 0 && !currentText && (
@@ -338,12 +376,13 @@ export default function App() {
         {/* Bottom Controls */}
         <div className="p-8 flex flex-col items-center gap-6 z-20">
             <div className="flex items-center gap-6">
-                <button 
+                <MicButton 
+                    isRecording={isMicActive}
                     onClick={() => setIsMicActive(!isMicActive)}
-                    className={`p-6 rounded-full transition-all duration-300 ${isMicActive ? 'bg-red-500/20 text-red-400 border-red-500/50' : 'bg-white/10 text-white border-white/20'} border hover:scale-105`}
-                >
-                    {isMicActive ? <Mic size={24} /> : <MicOff size={24} />}
-                </button>
+                    size={64}
+                    glowColor="rgb(239, 68, 68)"
+                    breathingDuration={1.8}
+                />
             </div>
             <button 
                 onClick={endSession}

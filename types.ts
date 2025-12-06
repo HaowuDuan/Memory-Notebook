@@ -3,6 +3,8 @@ export type AppState = 'LANDING' | 'UPLOAD' | 'RENDERING' | 'SESSION' | 'REVIEW'
 
 export type SessionState = 'IDLE' | 'LISTENING' | 'THINKING' | 'SPEAKING';
 
+export type VoiceConnectionStatus = 'idle' | 'connecting' | 'connected' | 'error';
+
 export interface MemoryTurn {
   role: 'user' | 'assistant';
   text: string;

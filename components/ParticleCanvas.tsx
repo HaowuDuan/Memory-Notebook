@@ -9,17 +9,23 @@ interface ParticleCanvasProps {
 
 const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, audioLevel }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  
+
   // Three.js References
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const particlesRef = useRef<THREE.Points | null>(null);
   const frameIdRef = useRef<number>(0);
-  
+  const audioLevelRef = useRef(audioLevel);
+
   // Animation State
   const mouseRef = useRef({ x: 0, y: 0 });
   const targetRotationRef = useRef({ x: 0, y: 0 });
+
+  // Keep audio level current without restarting the loop
+  useEffect(() => {
+    audioLevelRef.current = audioLevel;
+  }, [audioLevel]);
 
   // Generate a soft circle texture programmatically
   const getSpriteMaterial = () => {
@@ -67,6 +73,14 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
     const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000, 0);
+     // Ensure canvas fills the container
+     renderer.domElement.style.position = 'absolute';
+     renderer.domElement.style.top = '0';
+     renderer.domElement.style.left = '0';
+     renderer.domElement.style.width = '100%';
+     renderer.domElement.style.height = '100%';
+     
     containerRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -111,7 +125,7 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
         // --- IMAGE MODE ---
         const width = 200; // Resolution of point cloud
         const height = Math.floor(width * (img.height / img.width));
-        
+
         const canvas = document.createElement('canvas');
         canvas.width = width;
         canvas.height = height;
@@ -125,18 +139,19 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
           for (let x = 0; x < width; x++) {
             const i = (y * width + x) * 4;
             const r = data[i] / 255;
-            const g = data[i+1] / 255;
-            const b = data[i+2] / 255;
-            const a = data[i+3];
+            const g = data[i + 1] / 255;
+            const b = data[i + 2] / 255;
+            const a = data[i + 3];
 
-            if (a > 50 && (r+g+b) > 0.1) { // Skip dark/transparent pixels
+            // Skip dark/transparent pixels and downsample for a sparser cloud
+            if (a > 50 && (r + g + b) > 0.3 && Math.random() > 0.65) {
               // Center the positions
               const pX = (x - width / 2) * 0.2;
               const pY = -(y - height / 2) * 0.2; // Invert Y for 3D
-              
+
               // Z displacement based on brightness (Relief effect)
               const brightness = (r + g + b) / 3;
-              const pZ = (brightness - 0.5) * 10; 
+              const pZ = (brightness - 0.5) * 10;
 
               vertices.push(pX, pY, pZ);
               colors.push(r, g, b);
@@ -151,7 +166,7 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
           const y = (Math.random() - 0.5) * 150;
           const z = (Math.random() - 0.5) * 100;
           vertices.push(x, y, z);
-          
+
           // Bluish / White memory color
           colors.push(0.8, 0.9, 1);
         }
@@ -159,12 +174,29 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
 
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
       geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-      
+
       const material = getSpriteMaterial();
       // Adjust size based on mode
-      material.size = img ? 0.3 : 0.6; 
+      material.size = img ? 0.3 : 0.6;
 
       const points = new THREE.Points(geometry, material);
+      if (img) {
+        // Center and scale cloud so it sits comfortably in view
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+        const box = geometry.boundingBox;
+        const sphere = geometry.boundingSphere;
+        if (box) {
+          const center = new THREE.Vector3();
+          box.getCenter(center);
+          geometry.translate(-center.x, -center.y, -center.z);
+        }
+        if (sphere) {
+          const targetRadius = 35; // target visual radius in scene units
+          const scaleFactor = targetRadius / sphere.radius;
+          geometry.scale(scaleFactor, scaleFactor, scaleFactor);
+        }
+      }
       scene.add(points);
       particlesRef.current = points;
     };
@@ -181,6 +213,12 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
 
   // Animation Loop
   useEffect(() => {
+    if (!rendererRef.current || !sceneRef.current || !cameraRef.current) return;
+    if (!isActive) {
+      if (frameIdRef.current) cancelAnimationFrame(frameIdRef.current);
+      return;
+    }
+
     const animate = () => {
       frameIdRef.current = requestAnimationFrame(animate);
 
@@ -196,13 +234,13 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
           // Rotate the entire cloud gently
           particlesRef.current.rotation.y = time * 0.1 + targetRotationRef.current.x * 0.5;
           particlesRef.current.rotation.x = targetRotationRef.current.y * 0.2;
-          
+
           // Audio Reactivity (Breathing Scale)
           // Smoothly interpolate scale for organic feel
-          const targetScale = 1 + (audioLevel * 0.3);
+          const targetScale = 1 + (audioLevelRef.current * 0.3);
           const currentScale = particlesRef.current.scale.x;
           const newScale = currentScale + (targetScale - currentScale) * 0.1;
-          
+
           particlesRef.current.scale.set(newScale, newScale, newScale);
         }
 
@@ -217,7 +255,7 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
     animate();
 
     return () => cancelAnimationFrame(frameIdRef.current);
-  }, [audioLevel]);
+  }, [isActive]);
 
   const handleMouseMove = (e: React.MouseEvent) => {
     // Normalize mouse position -1 to 1
@@ -230,7 +268,8 @@ const ParticleCanvas: React.FC<ParticleCanvasProps> = ({ imageUrl, isActive, aud
     <div
       ref={containerRef}
       onMouseMove={handleMouseMove}
-      className={`fixed inset-0 z-0 transition-opacity duration-1000 ${isActive ? 'opacity-100' : 'opacity-0'}`}
+      className={`fixed inset-0 z-0 pointer-events-none transition-opacity duration-1000 ${isActive ? 'opacity-100' : 'opacity-0'}`}
+      style={{ width: '100vw', height: '100vh' }}
     />
   );
 };
