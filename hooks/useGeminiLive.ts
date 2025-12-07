@@ -1,37 +1,16 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { createBlob, decode, decodeAudioData } from '../utils/audio';
 
-// Transcript callbacks for handling transcription events
-export interface TranscriptCallbacks {
-  onUserTranscriptionChunk?: (text: string) => void;
-  onUserTranscriptionComplete?: (fullText: string) => void;
-  onAiTranscriptionChunk?: (text: string) => void;
-  onAiTranscriptionComplete?: (fullText: string) => void;
-  onTurnComplete?: () => void;
-  onInterrupted?: () => void;
-}
+import { createPcmBlob, decodeAudioData, base64ToUint8Array, PCM_SAMPLE_RATE, OUTPUT_SAMPLE_RATE } from '../services/audioStreamer';
 
-// Audio level callback for real-time visualization
-export interface AudioCallbacks {
-  onAudioLevel?: (level: number) => void;
-  onSpeakingStateChange?: (isSpeaking: boolean) => void;
-}
-
-// Hook configuration
-export interface UseGeminiLiveConfig {
-  systemInstruction?: string;
-  voiceName?: string;
-  photoContext?: string; // Base64 photo data for Memory-Notebook
-  transcriptCallbacks?: TranscriptCallbacks;
-  audioCallbacks?: AudioCallbacks;
-}
 
 export interface UseGeminiLiveReturn {
   isConnected: boolean;
   isConnecting: boolean;
   error: string | null;
-  connect: (config?: UseGeminiLiveConfig) => Promise<void>;
+
+  connect: (systemInstruction?: string) => Promise<void>;
+
   disconnect: () => void;
   audioContexts: {
     input: AudioContext | null;
@@ -41,9 +20,17 @@ export interface UseGeminiLiveReturn {
     input: AnalyserNode | null;
     output: AnalyserNode | null;
   };
+  onTranscript?: (text: string) => void;
+  onTurnComplete?: () => void;
+  setAudioLevel?: (level: number) => void;
 }
 
-export const useGeminiLive = (): UseGeminiLiveReturn => {
+export const useGeminiLive = (
+  onTranscript?: (text: string) => void,
+  onTurnComplete?: () => void,
+  setAudioLevel?: (level: number) => void
+): UseGeminiLiveReturn => {
+
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -57,12 +44,11 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
   const nextStartTimeRef = useRef<number>(0);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
-  const currentSessionRef = useRef<any>(null); // To track the actual session object for cleanup
 
-  // Refs for transcript accumulation
-  const currentUserTextRef = useRef<string>('');
-  const currentAiTextRef = useRef<string>('');
-  const configRef = useRef<UseGeminiLiveConfig>({});
+  const currentSessionRef = useRef<any>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
 
   // Cleanup function to stop all audio and close connections
   const cleanup = useCallback(() => {
@@ -76,12 +62,25 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
     });
     audioSourcesRef.current.clear();
 
+
+    // Disconnect and clean up script processor
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect();
+      scriptProcessorRef.current = null;
+    }
+
+    // Stop media stream
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+
     // Close audio contexts
-    if (inputAudioContextRef.current) {
+    if (inputAudioContextRef.current && inputAudioContextRef.current.state !== 'closed') {
       inputAudioContextRef.current.close();
       inputAudioContextRef.current = null;
     }
-    if (outputAudioContextRef.current) {
+    if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
       outputAudioContextRef.current.close();
       outputAudioContextRef.current = null;
     }
@@ -98,24 +97,19 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
       currentSessionRef.current = null;
     }
 
-    // Reset transcript accumulation
-    currentUserTextRef.current = '';
-    currentAiTextRef.current = '';
-
     sessionPromiseRef.current = null;
     setIsConnected(false);
     setIsConnecting(false);
     nextStartTimeRef.current = 0;
   }, []);
 
-  const connect = useCallback(async (config: UseGeminiLiveConfig = {}) => {
+
+  const connect = useCallback(async (systemInstruction?: string) => {
+
     if (!process.env.API_KEY) {
       setError("API Key not found in environment variables.");
       return;
     }
-
-    // Store config for callbacks
-    configRef.current = config;
 
     // Check if mediaDevices API is available
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -127,20 +121,17 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
       setIsConnecting(true);
       setError(null);
 
-      // Reset transcript accumulation
-      currentUserTextRef.current = '';
-      currentAiTextRef.current = '';
 
       // 1. Initialize Audio Contexts
-      // Input: 16kHz for Gemini
+
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioContextClass) {
         throw new Error("Your browser doesn't support Web Audio API.");
       }
 
-      const inputCtx = new AudioContextClass({ sampleRate: 16000 });
-      // Output: 24kHz for Gemini response
-      const outputCtx = new AudioContextClass({ sampleRate: 24000 });
+
+      const inputCtx = new AudioContextClass({ sampleRate: PCM_SAMPLE_RATE });
+      const outputCtx = new AudioContextClass({ sampleRate: OUTPUT_SAMPLE_RATE });
 
       inputAudioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
@@ -167,38 +158,62 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
       });
       console.log('Microphone access granted!');
 
+      streamRef.current = stream;
+
+
       // 4. Setup Input Pipeline
       const source = inputCtx.createMediaStreamSource(stream);
       const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+
+      scriptProcessorRef.current = scriptProcessor;
+
 
       source.connect(inputAnalyser);
       inputAnalyser.connect(scriptProcessor);
       scriptProcessor.connect(inputCtx.destination);
 
       // 5. Initialize Gemini Client
+
+      console.log('🔑 Initializing Gemini with API key:', process.env.API_KEY?.substring(0, 20) + '...');
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const model = 'gemini-2.5-flash-native-audio-preview-09-2025';
+      console.log('📡 Using model:', model);
 
       // 6. Define Session Callbacks
+      console.log('🔗 Attempting to connect to Gemini Live...');
+
       const sessionPromise = ai.live.connect({
         model,
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: config.voiceName || 'Kore' } },
+
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
           },
-          systemInstruction: config.systemInstruction || "You are a helpful, witty, and concise AI assistant. Keep your responses short and conversational.",
+          systemInstruction: systemInstruction || "You are a helpful, witty, and concise AI assistant. Keep your responses short and conversational.",
         },
         callbacks: {
           onopen: () => {
-            console.log('Gemini Live Session Opened');
+            console.log('✅ Gemini Live Session Opened - Connection successful!');
+
             setIsConnected(true);
             setIsConnecting(false);
 
             // Start processing audio input
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              const pcmBlob = createBlob(inputData);
+
+
+              // Calculate audio level for visualization
+              if (setAudioLevel) {
+                let sum = 0;
+                for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+                const rms = Math.sqrt(sum / inputData.length);
+                if (rms > 0.05) setAudioLevel(Math.min(rms * 5, 0.5));
+              }
+
+              const pcmBlob = createPcmBlob(inputData);
+
 
               // Send to Gemini
               if (sessionPromiseRef.current) {
@@ -209,125 +224,101 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
             };
           },
           onmessage: async (message: LiveServerMessage) => {
-            const content = message.serverContent;
 
-            // 1. Handle User Input Transcription (NEW - fixes missing user transcripts)
-            if (content?.inputTranscription?.text) {
-              const userChunk = content.inputTranscription.text;
-              currentUserTextRef.current += userChunk;
-              configRef.current.transcriptCallbacks?.onUserTranscriptionChunk?.(userChunk);
-            }
-
-            // Note: User input transcription completion is typically indicated by modelTurn starting
-            // We'll save the user text when we detect the AI is about to respond
-
-            // 2. Handle AI Output Transcription (IMPROVED - proper accumulation)
-            if (content?.outputTranscription?.text) {
-              const aiChunk = content.outputTranscription.text;
-              currentAiTextRef.current += aiChunk;
-              configRef.current.transcriptCallbacks?.onAiTranscriptionChunk?.(aiChunk);
-            }
-
-            // 3. Handle Audio Output
-            const base64Audio = content?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
-              // When AI starts responding, save any accumulated user text
-              if (currentUserTextRef.current && audioSourcesRef.current.size === 0) {
-                const fullUserText = currentUserTextRef.current;
-                configRef.current.transcriptCallbacks?.onUserTranscriptionComplete?.(fullUserText);
-                currentUserTextRef.current = ''; // Reset for next turn
-              }
-              const ctx = outputAudioContextRef.current;
-              if (!ctx) return;
-
-              // Notify speaking state
-              if (audioSourcesRef.current.size === 0) {
-                configRef.current.audioCallbacks?.onSpeakingStateChange?.(true);
-              }
-
-              // Ensure we schedule after the current time
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-
-              const audioBuffer = await decodeAudioData(
-                decode(base64Audio),
-                ctx,
-                24000,
-                1
-              );
-
-              const sourceNode = ctx.createBufferSource();
-              sourceNode.buffer = audioBuffer;
-              sourceNode.connect(outputAnalyserRef.current!); // Connect to analyser
-              outputAnalyserRef.current!.connect(ctx.destination); // Connect analyser to speaker
-
-              sourceNode.addEventListener('ended', () => {
-                audioSourcesRef.current.delete(sourceNode);
-                // Notify when all audio finished
-                if (audioSourcesRef.current.size === 0) {
-                  configRef.current.audioCallbacks?.onSpeakingStateChange?.(false);
-                }
-              });
-
-              sourceNode.start(nextStartTimeRef.current);
-              audioSourcesRef.current.add(sourceNode);
-
-              // Update next start time
-              nextStartTimeRef.current += audioBuffer.duration;
-
-              // Calculate audio level for visualization
-              const rawData = audioBuffer.getChannelData(0);
-              let sum = 0;
-              for (let i = 0; i < rawData.length; i += 100) {
-                sum += rawData[i] * rawData[i];
-              }
-              const level = Math.sqrt(sum / (rawData.length / 100)) * 5;
-              configRef.current.audioCallbacks?.onAudioLevel?.(level);
-            }
-
-            // 4. Handle Turn Complete (FIXED - now uses accumulated text)
-            if (content?.turnComplete) {
-              const fullAiText = currentAiTextRef.current;
-              configRef.current.transcriptCallbacks?.onAiTranscriptionComplete?.(fullAiText);
-              configRef.current.transcriptCallbacks?.onTurnComplete?.();
-              currentAiTextRef.current = ''; // Reset for next turn
-            }
-
-            // 5. Handle Interruption
-            if (content?.interrupted) {
+            // Handle Interruption
+            const interrupted = message.serverContent?.interrupted;
+            if (interrupted) {
               console.log('Interrupted! Clearing audio queue.');
               audioSourcesRef.current.forEach(src => {
                 try { src.stop(); } catch (e) { /* ignore */ }
               });
               audioSourcesRef.current.clear();
               nextStartTimeRef.current = 0;
+            }
 
-              // Clear current AI text as it was interrupted
-              currentAiTextRef.current = '';
-              configRef.current.transcriptCallbacks?.onInterrupted?.();
-              configRef.current.audioCallbacks?.onSpeakingStateChange?.(false);
+            // Handle Audio Output
+            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (base64Audio) {
+              const ctx = outputAudioContextRef.current;
+              if (!ctx) return;
+
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+
+              const audioBuffer = await decodeAudioData(
+                base64ToUint8Array(base64Audio),
+                ctx,
+                OUTPUT_SAMPLE_RATE,
+                1
+              );
+
+              // Visualize output audio
+              if (setAudioLevel) {
+                const rawData = audioBuffer.getChannelData(0);
+                let sum = 0;
+                for (let i = 0; i < rawData.length; i += 100) sum += rawData[i] * rawData[i];
+                setAudioLevel(Math.sqrt(sum / (rawData.length / 100)) * 5);
+              }
+
+              const sourceNode = ctx.createBufferSource();
+              sourceNode.buffer = audioBuffer;
+              sourceNode.connect(outputAnalyserRef.current!);
+              outputAnalyserRef.current!.connect(ctx.destination);
+
+              sourceNode.addEventListener('ended', () => {
+                audioSourcesRef.current.delete(sourceNode);
+
+              });
+
+              sourceNode.start(nextStartTimeRef.current);
+              audioSourcesRef.current.add(sourceNode);
+
+
+              nextStartTimeRef.current += audioBuffer.duration;
+            }
+
+            // Handle transcription
+            if (message.serverContent?.outputTranscription?.text && onTranscript) {
+              onTranscript(message.serverContent.outputTranscription.text);
+            }
+
+            // Handle turn complete
+            if (message.serverContent?.turnComplete && onTurnComplete) {
+              onTurnComplete();
             }
           },
           onclose: () => {
-            console.log('Gemini Live Session Closed');
+            console.log('🔌 Gemini Live Session Closed');
+            console.trace('Session close stack trace');
             cleanup();
           },
           onerror: (err) => {
-            console.error('Gemini Live Error:', err);
-            setError("Connection error occurred.");
+            console.error('💥 Gemini Live Error:', err);
+            console.error('Error details:', JSON.stringify(err, null, 2));
+            setError(err?.message || "Connection error occurred.");
+
             cleanup();
           }
         }
       });
 
       sessionPromiseRef.current = sessionPromise;
-      sessionPromise.then(sess => {
+
+      sessionPromise
+        .then(sess => {
+          console.log('✅ Session promise resolved successfully');
           currentSessionRef.current = sess;
-      });
+        })
+        .catch(err => {
+          console.error('💥 Session promise rejected:', err);
+          setError(err?.message || 'Failed to establish connection');
+          setIsConnecting(false);
+        });
+
 
     } catch (err: any) {
       console.error("Failed to connect:", err);
 
-      // Better error handling for different error types
+
       let errorMessage = "Failed to start conversation.";
 
       if (err instanceof DOMException) {
@@ -347,7 +338,9 @@ export const useGeminiLive = (): UseGeminiLiveReturn => {
       setError(errorMessage);
       cleanup();
     }
-  }, [cleanup]);
+
+  }, [cleanup, onTranscript, onTurnComplete, setAudioLevel]);
+
 
   const disconnect = useCallback(() => {
     cleanup();

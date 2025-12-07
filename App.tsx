@@ -1,5 +1,7 @@
-import React, { useState } from 'react';
-import { Share2, Sparkles, X, RotateCcw, Volume2, Download } from 'lucide-react';
+
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Upload, Mic, MicOff, Save, Share2, Sparkles, X, RotateCcw, Volume2, Volume1, Download } from 'lucide-react';
+
 
 import { AppState, SessionState, PhotoData, MemoryTurn } from './types';
 import { SYSTEM_INSTRUCTION, PRESET_IMAGES } from './constants';
@@ -12,52 +14,114 @@ import VoiceStatusIndicator, { VoiceConnectionStatus } from './components/VoiceS
 import { useGeminiLive } from './hooks/useGeminiLive';
 
 export default function App() {
+  // Debug: Check API key on component mount
+  useEffect(() => {
+    console.log('🔍 App mounted. Checking environment:');
+    console.log('  - API_KEY exists:', !!process.env.API_KEY);
+    console.log('  - API_KEY preview:', process.env.API_KEY?.substring(0, 20) + '...' || 'MISSING');
+    console.log('  - All env vars:', Object.keys(process.env));
+  }, []);
+
   // State
   const [appState, setAppState] = useState<AppState>('LANDING');
   const [sessionState, setSessionState] = useState<SessionState>('IDLE');
   const [photoData, setPhotoData] = useState<PhotoData | null>(null);
   const [transcript, setTranscript] = useState<MemoryTurn[]>([]);
   const [currentText, setCurrentText] = useState<string>('');
-  
+
   // Audio Controls
   const [isMusicPlaying, setIsMusicPlaying] = useState(false);
   const [musicVolume, setMusicVolume] = useState(0.5);
-  const [isMicActive, setIsMicActive] = useState(false);
-  
+
   // Visual Reactivity
   const [audioLevel, setAudioLevel] = useState(0); // 0.0 - 1.0 for visuals
-  
+
   // Voice UI States
   const [voiceStatus, setVoiceStatus] = useState<VoiceConnectionStatus>('idle');
 
-  // Use the enhanced Gemini Live hook
+
+ // Use the Gemini Live hook
   const {
-    connect: connectVoice,
-    disconnect: disconnectVoice,
     isConnected,
     isConnecting,
-    error: voiceError,
+    error: geminiError,
+    connect: connectGemini,
+    disconnect: disconnectGemini,
     analysers
-  } = useGeminiLive();
+  } = useGeminiLive(
+    // onTranscript callback
+    (text: string) => {
+      setCurrentText(prev => prev + text);
+    },
+    // onTurnComplete callback
+    () => {
+      setTranscript(prev => [...prev, {
+        role: 'assistant',
+        text: currentText,
+        timestamp: Date.now()
+      }]);
+      setCurrentText('');
+      setSessionState('IDLE');
+    },
+    // setAudioLevel callback
+    setAudioLevel
+  );
+
+  // Update voice status based on connection state
+  useEffect(() => {
+    console.log('🔄 Connection state changed:', { isConnecting, isConnected, hasError: !!geminiError });
+    if (isConnecting) {
+      setVoiceStatus('connecting');
+    } else if (isConnected) {
+      setVoiceStatus('connected');
+    } else if (geminiError) {
+      setVoiceStatus('error');
+      console.error('❌ Gemini Error:', geminiError);
+    } else {
+      setVoiceStatus('idle');
+    }
+  }, [isConnecting, isConnected, geminiError]);
+
+  // Monitor audio level to determine if AI is speaking
+  useEffect(() => {
+    if (audioLevel > 0.1) {
+      setSessionState('SPEAKING');
+    } else if (isConnected && audioLevel < 0.05) {
+      const timer = setTimeout(() => setSessionState('IDLE'), 500);
+      return () => clearTimeout(timer);
+    }
+  }, [audioLevel, isConnected]);
 
   // --- Helpers ---
 
-  // Load random preset image for particle effects
-  const startVoiceCompanion = () => {
-    const randomImage = PRESET_IMAGES[Math.floor(Math.random() * PRESET_IMAGES.length)];
-    const newPhotoData = {
-      file: null as any,
-      previewUrl: randomImage,
-      base64Data: '', // Not sending to AI
-      mimeType: 'image/jpeg'
-    };
-    setPhotoData(newPhotoData);
-    setAppState('RENDERING');
-    // Simulate rendering time for effect
-    setTimeout(() => {
-      setAppState('SESSION');
-      startSessionWithData(newPhotoData);
-    }, 2500);
+  const handleUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result as string;
+        // Extract base64 part
+        const base64Data = result.split(',')[1];
+        setPhotoData({
+          file,
+          previewUrl: result,
+          base64Data,
+          mimeType: file.type
+        });
+        setAppState('UPLOAD');
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const startMemoryProcess = () => {
+     setAppState('RENDERING');
+     // Simulate rendering time for effect
+     setTimeout(() => {
+         setAppState('SESSION');
+         // Don't auto-connect anymore - user will click mic button
+         setIsMusicPlaying(true);
+     }, 2500);
   };
 
   const downloadMemory = () => {
@@ -73,80 +137,63 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // --- Gemini Live Integration (Using Enhanced Hook) ---
 
-  const startSessionWithData = async (data: PhotoData) => {
-    setIsMusicPlaying(true);
-    setSessionState('IDLE');
-    setVoiceStatus('connecting');
-    setIsMicActive(true); // Auto-start mic
+ // --- Gemini Live Integration ---
 
-    // Connect using the enhanced hook with all callbacks
-    await connectVoice({
-      systemInstruction: SYSTEM_INSTRUCTION,
-      voiceName: 'Kore',
-      // Temporarily disable photo sending to debug
-      // photoContext: data.base64Data,
+  const handleMicClick = async () => {
+    console.log('🎤 Mic button clicked', { isConnected, isConnecting });
 
-      transcriptCallbacks: {
-        // Real-time AI speech display (for VoiceSubtitle)
-        onAiTranscriptionChunk: (text) => {
-          setCurrentText(prev => prev + text);
-        },
+    if (isConnected) {
+      // If already connected, disconnect
+      console.log('🔌 Disconnecting...');
+      disconnectGemini();
+      setSessionState('IDLE');
+      return;
+    }
 
-        // Save user message to history
-        onUserTranscriptionComplete: (fullText) => {
-          setTranscript(prev => [...prev, {
-            role: 'user',
-            text: fullText,
-            timestamp: Date.now()
-          }]);
-        },
+    if (isConnecting) {
+      console.log('⏳ Already connecting, please wait...');
+      return;
+    }
 
-        // Save AI message to history (FIXED - uses full accumulated text)
-        onAiTranscriptionComplete: (fullText) => {
-          setTranscript(prev => [...prev, {
-            role: 'assistant',
-            text: fullText,
-            timestamp: Date.now()
-          }]);
-          setCurrentText(''); // Clear for next turn
-        },
+    try {
+      // Start connection
+      console.log('🎤 Starting connection...', {
+        hasApiKey: !!process.env.API_KEY,
+        hasPhoto: !!photoData,
+        apiKey: process.env.API_KEY ? 'exists' : 'missing'
+      });
 
-        // Turn completed
-        onTurnComplete: () => {
-          setSessionState('IDLE');
-        },
-
-        // User interrupted AI
-        onInterrupted: () => {
-          setCurrentText(''); // Clear interrupted text
-          setSessionState('IDLE');
-        }
-      },
-
-      audioCallbacks: {
-        // Drive visualizations (waveform, particles)
-        onAudioLevel: (level) => {
-          setAudioLevel(level);
-        },
-
-        // Update UI state
-        onSpeakingStateChange: (speaking) => {
-          setSessionState(speaking ? 'SPEAKING' : 'IDLE');
-          if (!speaking) setAudioLevel(0);
-        }
+      if (!process.env.API_KEY) {
+          console.error('❌ API Key missing in process.env');
+          alert("API Key missing. Please check .env file and restart dev server.");
+          return;
       }
-    });
+      if (!photoData) {
+          console.error('❌ No photo data');
+          return;
+      }
 
-    setVoiceStatus('connected');
+      setSessionState('IDLE');
+
+      console.log('📡 Calling connectGemini with:', {
+        instructionLength: SYSTEM_INSTRUCTION.length
+      });
+
+      // Connect using the hook with system instruction
+      await connectGemini(SYSTEM_INSTRUCTION);
+
+      console.log('✅ connectGemini call completed');
+    } catch (error) {
+      console.error('💥 Error in handleMicClick:', error);
+      alert(`Connection failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   const endSession = () => {
-    disconnectVoice();
-    setAppState('REVIEW');
-    setIsMusicPlaying(false);
-    setVoiceStatus('idle');
+      disconnectGemini();
+      setAppState('REVIEW');
+      setIsMusicPlaying(false);
   };
 
   // --- UI Components ---
@@ -174,13 +221,37 @@ export default function App() {
     </div>
   );
 
+  const UploadPreview = () => (
+    <div className="relative z-10 flex flex-col items-center justify-center min-h-screen p-6 animate-fade-in">
+        {photoData && (
+            <div className="relative w-full max-w-md aspect-[3/4] md:aspect-square rounded-lg overflow-hidden shadow-2xl border border-white/10 mb-8">
+                <img src={photoData.previewUrl} alt="Preview" className="w-full h-full object-cover" />
+                <div className="absolute inset-0 bg-black/20" />
+            </div>
+        )}
+        <div className="flex gap-4">
+             <button
+                onClick={() => setAppState('LANDING')}
+                className="px-6 py-3 rounded-full border border-white/20 text-white/60 hover:text-white hover:bg-white/5 transition-all"
+             >
+                Try Another
+             </button>
+             <button
+                onClick={startMemoryProcess}
+                className="px-8 py-3 bg-white text-black rounded-full font-semibold hover:bg-gray-200 transition-all shadow-lg shadow-white/10"
+             >
+                Visualize & Speak
+             </button>
+        </div>
+    </div>
+  );
 
   const SessionView = () => (
     <div className="relative z-10 flex flex-col h-screen">
         {/* Header / Top Bar */}
         <div className="flex justify-between items-center p-6 text-white/50 z-20">
-            <VoiceStatusIndicator 
-              status={voiceStatus} 
+            <VoiceStatusIndicator
+              status={voiceStatus}
               showLabel={true}
               label="Gemini"
               size={10}
@@ -190,12 +261,12 @@ export default function App() {
                  <button onClick={() => setMusicVolume(v => v === 0 ? 0.5 : 0)}>
                      {musicVolume === 0 ? <X size={16}/> : <Volume2 size={16} />}
                  </button>
-                 <input 
-                    type="range" 
-                    min="0" 
-                    max="1" 
-                    step="0.1" 
-                    value={musicVolume} 
+                 <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    value={musicVolume}
                     onChange={(e) => setMusicVolume(parseFloat(e.target.value))}
                     className="w-20 accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"
                  />
@@ -204,10 +275,11 @@ export default function App() {
 
         {/* Central Visual Area */}
         <div className="flex-1 flex flex-col items-center justify-center relative p-6">
+
             {/* Voice Waveform - Shows above subtitle when speaking */}
-            {sessionState === 'SPEAKING' && (
+            {sessionState === 'SPEAKING' && isConnected && (
                 <div className="absolute top-1/3 left-1/2 -translate-x-1/2 z-20">
-                    <VoiceWaveform 
+                    <VoiceWaveform
                         audioLevel={audioLevel}
                         isActive={true}
                         type="bars"
@@ -221,35 +293,71 @@ export default function App() {
             )}
 
             {/* Voice Subtitle - AI's spoken text */}
-            <VoiceSubtitle 
-                text={currentText}
-                isVisible={!!currentText}
-                maxWidth="70%"
-                opacity={0.6}
-                fontSize="text-2xl md:text-3xl"
-                position="bottom"
-                typewriterEffect={true}
-                typewriterSpeed={30}
-            />
-            
-            {/* Guide hint if idle */}
-            {sessionState === 'IDLE' && transcript.length === 0 && !currentText && (
+            {isConnected && (
+                <VoiceSubtitle
+                    text={currentText}
+                    isVisible={!!currentText}
+                    maxWidth="70%"
+                    opacity={0.6}
+                    fontSize="text-2xl md:text-3xl"
+                    position="bottom"
+                    typewriterEffect={true}
+                    typewriterSpeed={30}
+                />
+            )}
+
+            {/* Connection Status Messages */}
+            {isConnecting && (
+                <div className="text-center space-y-4">
+                    <div className="w-10 h-10 border-t-2 border-white/50 rounded-full animate-spin mx-auto" />
+                    <p className="text-white/60 font-light animate-pulse">Connecting to Gemini...</p>
+                </div>
+            )}
+
+            {/* Guide hint if idle and connected */}
+            {sessionState === 'IDLE' && transcript.length === 0 && !currentText && isConnected && !isConnecting && (
                  <p className="text-white/40 font-light italic animate-pulse">Close your eyes and tell me about this moment...</p>
+            )}
+
+            {/* Waiting hint if not connected */}
+            {!isConnected && !isConnecting && !geminiError && (
+                 <p className="text-white/30 font-light italic">Tap the microphone when ready to begin</p>
+            )}
+
+            {/* Show error if any */}
+            {geminiError && (
+                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-6 max-w-md text-center">
+                    <p className="text-red-400 text-sm mb-2 font-semibold">Connection Error</p>
+                    <p className="text-red-300 text-xs">{geminiError}</p>
+                    <button
+                        onClick={() => window.location.reload()}
+                        className="mt-4 px-4 py-2 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 rounded-lg text-red-300 text-xs transition-colors"
+                    >
+                        Reload Page
+                    </button>
+                </div>
             )}
         </div>
 
         {/* Bottom Controls */}
         <div className="p-8 flex flex-col items-center gap-6 z-20">
             <div className="flex items-center gap-6">
-                <MicButton 
-                    isRecording={isMicActive}
-                    onClick={() => setIsMicActive(!isMicActive)}
-                    size={64}
-                    glowColor="rgb(239, 68, 68)"
-                    breathingDuration={1.8}
+                <MicButton
+                    isRecording={isConnected}
+                    onClick={handleMicClick}
+                    size={72}
+                    glowColor={isConnected ? "rgb(34, 197, 94)" : "rgb(99, 102, 241)"}
+                    breathingDuration={2.5}
+                    disabled={isConnecting}
                 />
             </div>
-            <button 
+            {!isConnected && !isConnecting && (
+                <p className="text-sm text-white/50 font-light">Tap to start your conversation</p>
+            )}
+            {isConnected && (
+                <p className="text-sm text-emerald-400 font-light">● Live - Speak freely</p>
+            )}
+            <button
                 onClick={endSession}
                 className="text-xs text-white/30 hover:text-white transition-colors border-b border-transparent hover:border-white"
             >
@@ -278,8 +386,8 @@ export default function App() {
                   {transcript.length > 0 ? transcript.map((turn, i) => (
                       <div key={i} className={`flex ${turn.role === 'assistant' ? 'justify-start' : 'justify-end'}`}>
                           <div className={`max-w-[80%] p-3 rounded-lg text-sm leading-relaxed ${
-                              turn.role === 'assistant' 
-                              ? 'bg-white/5 text-gray-300' 
+                              turn.role === 'assistant'
+                              ? 'bg-white/5 text-gray-300'
                               : 'bg-white/10 text-white'
                           }`}>
                               {turn.text || "(Audio segment)"}
@@ -309,18 +417,18 @@ export default function App() {
 
   return (
     <div className="relative w-full h-screen bg-black overflow-hidden selection:bg-white/20">
-      
+
       {/* Background Visuals - Always active now */}
-      <ParticleCanvas 
-        imageUrl={appState === 'LANDING' ? null : photoData?.previewUrl || null} 
-        isActive={true} 
+      <ParticleCanvas
+        imageUrl={appState === 'LANDING' ? null : photoData?.previewUrl || null}
+        isActive={true}
         audioLevel={audioLevel}
       />
 
       {/* Audio Layer */}
-      <AmbiencePlayer 
-        play={isMusicPlaying} 
-        ducking={sessionState === 'SPEAKING' || isMicActive}
+      <AmbiencePlayer
+        play={isMusicPlaying}
+        ducking={sessionState === 'SPEAKING' || isConnected}
         volume={musicVolume}
       />
 

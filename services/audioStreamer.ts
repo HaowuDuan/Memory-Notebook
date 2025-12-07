@@ -27,9 +27,9 @@ export function createPcmBlob(data: Float32Array): Blob {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {
-    // Clamp values to [-1, 1] range to prevent distortion
-    const s = Math.max(-1, Math.min(1, data[i]));
-    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    // Clamp values to [-1, 1] before scaling to avoid wrapping artifacts
+    const clamped = Math.max(-1, Math.min(1, data[i]));
+    int16[i] = clamped * 32767;
   }
   return {
     data: arrayBufferToBase64(int16.buffer),
