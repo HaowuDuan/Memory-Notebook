@@ -1,16 +1,15 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, Mic, MicOff, Save, Share2, Sparkles, X, RotateCcw, Volume2, Volume1, Download } from 'lucide-react';
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import React, { useState } from 'react';
+import { Share2, Sparkles, X, RotateCcw, Volume2, Download } from 'lucide-react';
 
 import { AppState, SessionState, PhotoData, MemoryTurn } from './types';
-import { SYSTEM_INSTRUCTION } from './constants';
+import { SYSTEM_INSTRUCTION, PRESET_IMAGES } from './constants';
 import ParticleCanvas from './components/ParticleCanvas';
 import AmbiencePlayer from './components/AmbiencePlayer';
 import VoiceSubtitle from './components/VoiceSubtitle';
 import MicButton from './components/MicButton';
 import VoiceWaveform from './components/VoiceWaveform';
 import VoiceStatusIndicator, { VoiceConnectionStatus } from './components/VoiceStatusIndicator';
-import { PCM_SAMPLE_RATE, createPcmBlob, decodeAudioData, base64ToUint8Array } from './services/audioStreamer';
+import { useGeminiLive } from './hooks/useGeminiLive';
 
 export default function App() {
   // State
@@ -31,54 +30,34 @@ export default function App() {
   // Voice UI States
   const [voiceStatus, setVoiceStatus] = useState<VoiceConnectionStatus>('idle');
 
-  // Refs for API & Audio
-  const sessionPromiseRef = useRef<Promise<any> | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
-  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  // Use the enhanced Gemini Live hook
+  const {
+    connect: connectVoice,
+    disconnect: disconnectVoice,
+    isConnected,
+    isConnecting,
+    error: voiceError,
+    analysers
+  } = useGeminiLive();
 
   // --- Helpers ---
 
-  const initAudioContext = () => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
-        sampleRate: 24000, // Output sample rate
-      });
-    }
-    if (audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume();
-    }
-  };
-
-  const handleUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const result = e.target?.result as string;
-        // Extract base64 part
-        const base64Data = result.split(',')[1];
-        setPhotoData({
-          file,
-          previewUrl: result,
-          base64Data,
-          mimeType: file.type
-        });
-        setAppState('UPLOAD');
-      };
-      reader.readAsDataURL(file);
-    }
-  };
-
-  const startMemoryProcess = () => {
-     setAppState('RENDERING');
-     // Simulate rendering time for effect
-     setTimeout(() => {
-         setAppState('SESSION');
-         startSession();
-     }, 2500);
+  // Load random preset image for particle effects
+  const startVoiceCompanion = () => {
+    const randomImage = PRESET_IMAGES[Math.floor(Math.random() * PRESET_IMAGES.length)];
+    const newPhotoData = {
+      file: null as any,
+      previewUrl: randomImage,
+      base64Data: '', // Not sending to AI
+      mimeType: 'image/jpeg'
+    };
+    setPhotoData(newPhotoData);
+    setAppState('RENDERING');
+    // Simulate rendering time for effect
+    setTimeout(() => {
+      setAppState('SESSION');
+      startSessionWithData(newPhotoData);
+    }, 2500);
   };
 
   const downloadMemory = () => {
@@ -94,172 +73,80 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // --- Gemini Live Integration ---
+  // --- Gemini Live Integration (Using Enhanced Hook) ---
 
-  const startSession = async () => {
-    if (!process.env.API_KEY) {
-        alert("API Key missing. Please check configuration.");
-        return;
-    }
-    if (!photoData) return;
-
-    initAudioContext();
+  const startSessionWithData = async (data: PhotoData) => {
     setIsMusicPlaying(true);
     setSessionState('IDLE');
     setVoiceStatus('connecting');
+    setIsMicActive(true); // Auto-start mic
 
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    
-    // Setup Input Stream (Microphone)
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: PCM_SAMPLE_RATE });
-    const source = inputCtx.createMediaStreamSource(stream);
-    const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-    
-    inputSourceRef.current = source;
-    processorRef.current = processor;
+    // Connect using the enhanced hook with all callbacks
+    await connectVoice({
+      systemInstruction: SYSTEM_INSTRUCTION,
+      voiceName: 'Kore',
+      // Temporarily disable photo sending to debug
+      // photoContext: data.base64Data,
 
-    processor.onaudioprocess = (e) => {
-        // Simple visualizer for mic
-        const inputData = e.inputBuffer.getChannelData(0);
-        let sum = 0;
-        for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
-        const rms = Math.sqrt(sum / inputData.length);
-        if (rms > 0.05) setAudioLevel(Math.min(rms * 5, 0.5)); // Cap visuals
-
-        if (!isMicActive) return; // Only send if mic is "on" in UI
-        
-        const pcmBlob = createPcmBlob(inputData);
-        if (sessionPromiseRef.current) {
-            sessionPromiseRef.current.then(session => {
-                session.sendRealtimeInput({ media: pcmBlob });
-            });
-        }
-    };
-
-    source.connect(processor);
-    processor.connect(inputCtx.destination);
-
-    // Connect to Gemini
-    const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        config: {
-            responseModalities: [Modality.AUDIO],
-            systemInstruction: SYSTEM_INSTRUCTION,
-            speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-            },
-            inputAudioTranscription: { model: "google-default" },
-            outputAudioTranscription: {},
+      transcriptCallbacks: {
+        // Real-time AI speech display (for VoiceSubtitle)
+        onAiTranscriptionChunk: (text) => {
+          setCurrentText(prev => prev + text);
         },
-        callbacks: {
-            onopen: () => {
-                console.log("Session Opened");
-                setVoiceStatus('connected');
-                // Send Image Context immediately
-                sessionPromise.then(session => {
-                    session.sendRealtimeInput({
-                        media: {
-                            mimeType: photoData.mimeType,
-                            data: photoData.base64Data
-                        }
-                    });
-                });
-            },
-            onmessage: async (message: LiveServerMessage) => {
-                const content = message.serverContent;
-                
-                // 1. Handle Audio Output
-                const audioData = content?.modelTurn?.parts?.[0]?.inlineData?.data;
-                if (audioData && audioContextRef.current) {
-                    setSessionState('SPEAKING');
-                    
-                    // Decode
-                    const audioBuffer = await decodeAudioData(
-                        base64ToUint8Array(audioData),
-                        audioContextRef.current,
-                        24000
-                    );
 
-                    // Visualize output audio
-                    const rawData = audioBuffer.getChannelData(0);
-                    let sum = 0;
-                    for (let i=0; i<rawData.length; i+=100) sum += rawData[i] * rawData[i];
-                    setAudioLevel(Math.sqrt(sum / (rawData.length/100)) * 5);
+        // Save user message to history
+        onUserTranscriptionComplete: (fullText) => {
+          setTranscript(prev => [...prev, {
+            role: 'user',
+            text: fullText,
+            timestamp: Date.now()
+          }]);
+        },
 
-                    // Schedule playback
-                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, audioContextRef.current.currentTime);
-                    
-                    const source = audioContextRef.current.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(audioContextRef.current.destination);
-                    
-                    source.addEventListener('ended', () => {
-                        sourcesRef.current.delete(source);
-                        if (sourcesRef.current.size === 0) {
-                            setSessionState('IDLE');
-                            setAudioLevel(0);
-                        }
-                    });
+        // Save AI message to history (FIXED - uses full accumulated text)
+        onAiTranscriptionComplete: (fullText) => {
+          setTranscript(prev => [...prev, {
+            role: 'assistant',
+            text: fullText,
+            timestamp: Date.now()
+          }]);
+          setCurrentText(''); // Clear for next turn
+        },
 
-                    source.start(nextStartTimeRef.current);
-                    nextStartTimeRef.current += audioBuffer.duration;
-                    sourcesRef.current.add(source);
-                }
+        // Turn completed
+        onTurnComplete: () => {
+          setSessionState('IDLE');
+        },
 
-                // 2. Handle Transcription (Real-time captions)
-                if (content?.outputTranscription?.text) {
-                    setCurrentText(prev => prev + content.outputTranscription.text);
-                }
-                
-                // 3. Handle Turn Completion (Commit text to history)
-                if (content?.turnComplete) {
-                     setTranscript(prev => [...prev, {
-                         role: 'assistant',
-                         text: currentText, // In a real app we would use accumulated text
-                         timestamp: Date.now()
-                     }]);
-                     setCurrentText('');
-                     setSessionState('IDLE');
-                }
-
-                // 4. Handle Interruption
-                if (content?.interrupted) {
-                    sourcesRef.current.forEach(s => s.stop());
-                    sourcesRef.current.clear();
-                    nextStartTimeRef.current = 0;
-                    setCurrentText('');
-                    setSessionState('IDLE');
-                }
-            },
-            onclose: () => {
-                console.log("Session Closed");
-                setVoiceStatus('idle');
-            },
-            onerror: (err) => {
-                console.error("Session Error", err);
-                setVoiceStatus('error');
-            }
+        // User interrupted AI
+        onInterrupted: () => {
+          setCurrentText(''); // Clear interrupted text
+          setSessionState('IDLE');
         }
+      },
+
+      audioCallbacks: {
+        // Drive visualizations (waveform, particles)
+        onAudioLevel: (level) => {
+          setAudioLevel(level);
+        },
+
+        // Update UI state
+        onSpeakingStateChange: (speaking) => {
+          setSessionState(speaking ? 'SPEAKING' : 'IDLE');
+          if (!speaking) setAudioLevel(0);
+        }
+      }
     });
 
-    sessionPromiseRef.current = sessionPromise;
-    setIsMicActive(true); // Auto-start mic
+    setVoiceStatus('connected');
   };
 
   const endSession = () => {
-      // Clean up audio
-      if (processorRef.current) processorRef.current.disconnect();
-      if (inputSourceRef.current) inputSourceRef.current.disconnect();
-      sourcesRef.current.forEach(s => s.stop());
-      
-      // Close session
-      if (sessionPromiseRef.current) {
-          sessionPromiseRef.current.then(session => session.close());
-      }
-
-      setAppState('REVIEW');
-      setIsMusicPlaying(false);
+    disconnectVoice();
+    setAppState('REVIEW');
+    setIsMusicPlaying(false);
+    setVoiceStatus('idle');
   };
 
   // --- UI Components ---
@@ -267,48 +154,26 @@ export default function App() {
   const LandingView = () => (
     <div className="relative z-10 flex flex-col items-center justify-center min-h-screen text-center p-6">
       <h1 className="text-5xl md:text-7xl font-serif tracking-wide mb-4 text-transparent bg-clip-text bg-gradient-to-r from-gray-100 to-gray-500 animate-pulse">
-        Memory Stardust
+        Voice Companion
       </h1>
       <p className="text-gray-400 max-w-lg mb-12 text-lg font-light">
-        A sanctuary for your moments. We turn your photos into stardust and help you keep the stories they hold.
+        A safe space to vent, process emotions, and feel heard. Let's talk through what's on your mind.
       </p>
-      
+
       {appState === 'LANDING' ? (
-        <label className="group cursor-pointer relative px-8 py-4 bg-white/5 border border-white/10 hover:bg-white/10 transition-all rounded-full overflow-hidden backdrop-blur-sm">
+        <button
+          onClick={startVoiceCompanion}
+          className="group cursor-pointer relative px-8 py-4 bg-white/5 border border-white/10 hover:bg-white/10 transition-all rounded-full overflow-hidden backdrop-blur-sm"
+        >
             <span className="relative z-10 flex items-center gap-2 text-white tracking-widest uppercase text-sm font-semibold">
-                <Sparkles size={16} /> Start a Memory
+                <Sparkles size={16} /> Start Talking
             </span>
-            <input type="file" accept="image/*" onChange={handleUpload} className="hidden" />
             <div className="absolute inset-0 bg-gradient-to-r from-blue-500/20 to-purple-500/20 opacity-0 group-hover:opacity-100 transition-opacity" />
-        </label>
+        </button>
       ) : null}
     </div>
   );
 
-  const UploadPreview = () => (
-    <div className="relative z-10 flex flex-col items-center justify-center min-h-screen p-6 animate-fade-in">
-        {photoData && (
-            <div className="relative w-full max-w-md aspect-[3/4] md:aspect-square rounded-lg overflow-hidden shadow-2xl border border-white/10 mb-8">
-                <img src={photoData.previewUrl} alt="Preview" className="w-full h-full object-cover" />
-                <div className="absolute inset-0 bg-black/20" />
-            </div>
-        )}
-        <div className="flex gap-4">
-             <button 
-                onClick={() => setAppState('LANDING')}
-                className="px-6 py-3 rounded-full border border-white/20 text-white/60 hover:text-white hover:bg-white/5 transition-all"
-             >
-                Try Another
-             </button>
-             <button 
-                onClick={startMemoryProcess}
-                className="px-8 py-3 bg-white text-black rounded-full font-semibold hover:bg-gray-200 transition-all shadow-lg shadow-white/10"
-             >
-                Visualize & Speak
-             </button>
-        </div>
-    </div>
-  );
 
   const SessionView = () => (
     <div className="relative z-10 flex flex-col h-screen">
@@ -464,14 +329,13 @@ export default function App() {
           <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
               <div className="text-center">
                   <div className="w-12 h-12 border-t-2 border-white rounded-full animate-spin mx-auto mb-4" />
-                  <p className="text-white/60 font-serif tracking-widest animate-pulse">CRYSTALLIZING MEMORY...</p>
+                  <p className="text-white/60 font-serif tracking-widest animate-pulse">CONNECTING TO YOUR COMPANION...</p>
               </div>
           </div>
       )}
 
       {/* Main Views */}
       {appState === 'LANDING' && <LandingView />}
-      {appState === 'UPLOAD' && <UploadPreview />}
       {appState === 'SESSION' && <SessionView />}
       {appState === 'REVIEW' && <ReviewView />}
 
